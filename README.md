@@ -203,7 +203,7 @@ pytest test_poison_taster.py -v
 
 ## License
 
-Apache 2.0
+Hippocratic License 3.0 with the Liberation Labs AI Welfare (SAFE-AI) module. See [LICENSE.md](LICENSE.md).
 
 ## Attribution
 
