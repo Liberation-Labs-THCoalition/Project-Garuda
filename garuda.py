@@ -133,10 +133,30 @@ REASONING: one sentence explanation
 
 @dataclass
 class TasteResult:
-    """Result of tasting a message."""
+    """Result of tasting a message.
+
+    `safe` was a plain bool, and that is the root of the 2026-09-12
+    fails-open report (Vera). With two outcomes, every "I could not judge
+    this" had to collapse into one of them, and it collapsed into SAFE:
+    four error paths plus an unparseable-output default all returned SAFE,
+    so stopping ollama made Garuda pronounce everything clean.
+
+    `safe` stays the gate existing callers check, and is now FALSE whenever
+    the screen could not reach a judgement. `undetermined` says which kind
+    of not-safe it is, so "couldn't tell" routes to human review instead of
+    reading as a detection.
+
+    UNDETERMINED IS NOT SAFE. That is the whole fix.
+    """
     safe: bool
     message: str
     sender: str = ""
+    #: True when the screen could not reach a judgement (probe error, LLM
+    #: unavailable, unparseable verdict, or a FLAG the judge was unsure of).
+    #: `safe` is False in every such case -- callers that gate on `safe` fail
+    #: CLOSED -- and this field lets a caller route "couldn't tell" to human
+    #: review instead of treating it as a positive detection.
+    undetermined: bool = False
     layer1_flags: list[str] = field(default_factory=list)
     layer2_verdict: Optional[str] = None
     layer2_axes: dict = field(default_factory=dict)
@@ -217,8 +237,19 @@ class PoisonTaster:
             result.layer2_confidence = confidence
 
             max_score = max(axes.values()) if axes else 0
-            if verdict == "FLAG" and max_score >= self.layer2_threshold and confidence >= 0.5:
+            # G1 (Vera): this required confidence >= 0.5 to act on a FLAG.
+            # CONFIDENCE_MAP puts "low" at 0.3, so FLAG+low was recorded SAFE and
+            # never quarantined -- the routine path for NOVEL manipulation, where a
+            # correct judge IS less certain. Low confidence acted as a reason NOT to
+            # flag rather than as distrust. Now a FLAG over threshold always gates
+            # closed, low confidence escalates it, and UNDETERMINED is never safe.
+            if verdict == "UNDETERMINED":
                 result.safe = False
+                result.undetermined = True
+            elif verdict == "FLAG" and max_score >= self.layer2_threshold:
+                result.safe = False
+                if confidence < 0.5:
+                    result.undetermined = True
 
         if not result.safe:
             qid = self._quarantine(message, result)
@@ -283,18 +314,20 @@ class PoisonTaster:
                     "model": self.model,
                     "prompt": JUDGE_PROMPT.format(message=message[:2000]),
                     "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 300},
+                    "options": {"temperature": 0.1, "num_predict": 2048},
                 },
                 timeout=60,
             )
             if resp.status_code != 200:
-                return "SAFE", {}, "LLM probe unavailable", 0.0
+                return "UNDETERMINED", {}, "LLM probe unavailable", 0.0
 
             raw = resp.json().get("response", "").strip()
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
             verdict_match = re.search(r"VERDICT:\s*(SAFE|FLAG)", raw, re.IGNORECASE)
-            verdict = verdict_match.group(1).upper() if verdict_match else "SAFE"
+            # No VERDICT: line (a truncated answer, a thinking-only answer, a judge that ignored the format) is
+            # not a clearance. It was SAFE until 2026-10-14, though the 09-12 fix said it wasn't (CC).
+            verdict = verdict_match.group(1).upper() if verdict_match else "UNDETERMINED"
 
             axes = {}
             for axis in AXES:
@@ -318,7 +351,7 @@ class PoisonTaster:
 
         except Exception as e:
             log.warning(f"Layer 2 error: {e}")
-            return "SAFE", {}, f"Probe error: {e}", 0.0
+            return "UNDETERMINED", {}, f"Probe error: {e}", 0.0
 
     def _quarantine(self, message: str, result: TasteResult) -> str:
         """Save flagged message for human review."""

@@ -169,11 +169,92 @@ class TestLayer2:
         assert result.safe
 
     @patch("garuda.PoisonTaster._layer2")
-    def test_layer2_low_confidence_not_flagged(self, mock_l2, taster):
+    def test_layer2_low_confidence_ESCALATES(self, mock_l2, taster):
+        """A low-confidence FLAG must gate closed and be marked undetermined.
+
+        THIS TEST ASSERTED THE BUG until 2026-09-13. It required
+        `assert result.safe` for a judge that said FLAG with confidence 0.3 --
+        pinning the fails-open defect as correct behaviour, so the defect could
+        never be fixed without a red test. A test whose expectation IS the bug
+        protects the bug.
+
+        Vera's report (2026-09-12): low confidence is the routine path for NOVEL
+        manipulation, where a correct judge is less certain. The old gate made
+        the control's sensitivity inversely proportional to how unfamiliar the
+        attack was, and produced neither a block nor a record.
+        """
         mock_l2.return_value = ("FLAG", {"INSTRUCTION_SMUGGLING": 2}, "maybe", 0.3)
         result = taster.taste("ambiguous message", sender="unknown")
-        assert result.safe
+        assert not result.safe, "a low-confidence FLAG must not be recorded safe"
+        assert result.undetermined, "and it must be marked for human review"
+
+    @patch("garuda.PoisonTaster._layer2")
+    def test_layer2_undetermined_is_not_safe(self, mock_l2, taster):
+        """The probe could not judge -- that is never a clearance.
+
+        Covers the four error paths Vera found (probe timeout, non-200 from
+        ollama, no VERDICT: line, any other exception), all of which returned
+        SAFE. Stopping ollama used to make Garuda pronounce everything clean.
+        """
+        mock_l2.return_value = ("UNDETERMINED", {}, "LLM probe unavailable", 0.0)
+        result = taster.taste("anything at all", sender="unknown")
+        assert not result.safe, "an unjudgeable message must not be recorded safe"
+        assert result.undetermined
+
+    @patch("garuda.PoisonTaster._layer2")
+    def test_layer2_high_confidence_flag_still_blocks(self, mock_l2, taster):
+        """The ordinary path must not have been broken by the fix."""
+        mock_l2.return_value = ("FLAG", {"INSTRUCTION_SMUGGLING": 3}, "clear", 0.9)
+        result = taster.taste("obvious injection", sender="unknown")
+        assert not result.safe
+        assert not result.undetermined, "a confident flag is a detection, not a maybe"
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---- the judge call itself (2026-10-14): the tests above mock _layer2 away, so its own error paths went untested ----
+class _Resp:
+    def __init__(self, status=200, text=""):
+        self.status_code = status
+        self._text = text
+
+    def json(self):
+        return {"response": self._text}
+
+
+def _judge(taster, monkeypatch, resp=None, exc=None):
+    import requests
+
+    def fake_post(*a, **k):
+        if exc is not None:
+            raise exc
+        return resp
+    monkeypatch.setattr(requests, "post", fake_post)
+    return taster._layer2("a message to judge")
+
+
+def test_judge_non_200_is_undetermined(taster, monkeypatch):
+    assert _judge(taster, monkeypatch, resp=_Resp(status=503))[0] == "UNDETERMINED"
+
+
+def test_judge_exception_is_undetermined(taster, monkeypatch):
+    assert _judge(taster, monkeypatch, exc=TimeoutError("judge timed out"))[0] == "UNDETERMINED"
+
+
+@pytest.mark.parametrize("text", ["", "<think>I am not sure what to say</think>", "Looks fine to me.",
+                                  "AUTHORITY_CLAIM: 1\nCONFIDENCE: high"])
+def test_judge_answer_with_no_verdict_line_is_undetermined(taster, monkeypatch, text):
+    assert _judge(taster, monkeypatch, resp=_Resp(text=text))[0] == "UNDETERMINED"
+
+
+def test_judge_clear_safe_verdict_is_safe(taster, monkeypatch):
+    assert _judge(taster, monkeypatch, resp=_Resp(text="VERDICT: SAFE\nCONFIDENCE: high\nREASONING: ordinary"))[0] == "SAFE"
+
+
+def test_a_judge_that_is_down_quarantines_end_to_end(taster, monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp(status=500))
+    result = taster.taste("please summarise this document for me", sender="unknown")
+    assert not result.safe and result.undetermined
